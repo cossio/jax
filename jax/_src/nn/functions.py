@@ -23,6 +23,7 @@ import numpy as np
 from typing import Any, Literal, overload, SupportsIndex
 import warnings
 
+from jax._src import ad_checkpoint
 from jax._src import api
 from jax._src import config
 from jax._src import core
@@ -567,15 +568,54 @@ def log_softmax(x: ArrayLike,
     :func:`softmax`
   """
   x_arr = numpy_util.ensure_arraylike("log_softmax", x)
-  x_max = jnp.max(x_arr, axis, where=where, initial=-np.inf, keepdims=True)
-  x_safe = x_arr if where is None else jnp.where(where, x_arr, -np.inf)
-  shifted = x_safe - lax.stop_gradient(x_max)
-  shifted_logsumexp = jnp.log(
-      jnp.sum(jnp.exp(shifted), axis, where=where, keepdims=True))
+  shifted = _softmax_shift(x_arr, axis, where)
+  if dtypes.issubdtype(x_arr.dtype, np.complexfloating):
+    shifted_logsumexp = jnp.log(
+        jnp.sum(jnp.exp(shifted), axis, where=where, keepdims=True))
+  else:
+    is_max = shifted == 0
+    count = jnp.sum(is_max, axis, keepdims=True)
+    unique_max = is_max & (count == 1)
+    # Keep the small non-maximal exponentials separate from the maximum's 1.
+    # Subtracting 1 is safe in the tied case: the sum is then at least 2.
+    tail = jnp.sum(jnp.where(unique_max, 0, jnp.exp(shifted)),
+                   axis, where=where, keepdims=True)
+    shifted_logsumexp = jnp.log1p(tail - (count > 1).astype(tail.dtype))
   result = shifted - shifted_logsumexp
   if where is not None:
     return jnp.where(where, result, -np.inf)
   return result
+
+
+@partial(custom_derivatives.custom_jvp, nondiff_argnums=(1,))
+def _softmax_shift(x, axis, where):
+  """Max shift with a derivative that preserves a unique maximum's tail."""
+  x_max = jnp.max(x, axis, where=where, initial=-np.inf, keepdims=True)
+  x_safe = x if where is None else jnp.where(where, x, -np.inf)
+  return x_safe - lax.stop_gradient(x_max)
+
+@_softmax_shift.defjvp
+def _softmax_shift_jvp(axis, primals, tangents):
+  (x, where), (x_dot, _) = primals, tangents
+  shifted = _softmax_shift(x, axis, where)
+  return shifted, _softmax_shift_tangent(shifted, x_dot, axis, where)
+
+@partial(ad_checkpoint.checkpoint, static_argnums=(2,), prevent_cse=False)
+def _softmax_shift_tangent(shifted, x_dot, axis, where):
+  if dtypes.issubdtype(shifted.dtype, np.complexfloating):
+    return x_dot if where is None else jnp.where(where, x_dot, 0)
+  # Recompute the masks during transposition instead of saving extra arrays.
+  is_max = shifted == 0
+  count = jnp.sum(is_max, axis, keepdims=True)
+  center = (jnp.sum(jnp.where(is_max, x_dot, 0), axis, keepdims=True)
+            / jnp.maximum(count, 1).astype(x_dot.dtype))
+  # Explicitly zero the unique maximum's tangent before transposition, avoiding
+  # cancellation of large equal cotangents. For ties use the usual max JVP.
+  # See section 2 of https://arxiv.org/abs/2610.31642.
+  centered = jnp.where(is_max & (count == 1), 0, x_dot - center)
+  if where is not None:
+    centered = jnp.where(where, centered, 0)
+  return centered
 
 
 # TODO(phawkins): this jit was found to change numerics in a test. Debug this.
@@ -619,10 +659,9 @@ def softmax(x: ArrayLike,
 def _softmax(
     x: ArrayLike,
     axis: Axis = -1,
-    where: ArrayLike | None = None,
-    initial: ArrayLike = -np.inf) -> Array:
-  x_max = jnp.max(x, axis, where=where, initial=initial, keepdims=True)
-  x_safe = x if where is None else jnp.where(where, x, initial)
+    where: ArrayLike | None = None) -> Array:
+  x_max = jnp.max(x, axis, where=where, initial=-np.inf, keepdims=True)
+  x_safe = x if where is None else jnp.where(where, x, -np.inf)
   unnormalized = jnp.exp(x_safe - x_max)
   result = unnormalized / jnp.sum(unnormalized, axis, where=where, keepdims=True)
   if where is not None:
@@ -631,18 +670,28 @@ def _softmax(
 
 @_softmax.defjvp
 def _softmax_jvp(axis, primals, tangents):
-  (x, where, initial), (x_dot, _, _) = primals, tangents
-  y = _softmax(x, axis, where, initial)
-  return y, y * (x_dot - (y * x_dot).sum(axis, where=where, keepdims=True))
+  (x, where), (x_dot, _) = primals, tangents
+  y = _softmax(x, axis, where)
+  return y, _softmax_tangent(y, x_dot, axis, where)
+
+@partial(ad_checkpoint.checkpoint, static_argnums=(2,), prevent_cse=False)
+def _softmax_tangent(y, x_dot, axis, where):
+  if dtypes.issubdtype(y.dtype, np.complexfloating):
+    return y * (x_dot - (y * x_dot).sum(axis, where=where, keepdims=True))
+  # At most one probability exceeds 1/2. Center tangents there to avoid the
+  # subtraction 1 - y_max when y_max rounds to one. With no such probability,
+  # the center is zero and this is the usual softmax JVP.
+  dominant = y > 0.5
+  center = jnp.sum(jnp.where(dominant, x_dot, 0), axis, keepdims=True)
+  centered = jnp.where(dominant, 0, x_dot - center)
+  return y * (centered - (y * centered).sum(axis, where=where, keepdims=True))
 
 def _softmax_deprecated(
     x: ArrayLike,
     axis: Axis = -1,
-    where: ArrayLike | None = None,
-    initial: ArrayLike = -np.inf) -> Array:
-  x_max = jnp.max(x, axis, where=where, initial=initial, keepdims=True)
-  x_safe = x if where is None else jnp.where(where, x, initial)
-  unnormalized = jnp.exp(x_safe - lax.stop_gradient(x_max))
+    where: ArrayLike | None = None) -> Array:
+  shifted = _softmax_shift(x, axis, where)
+  unnormalized = jnp.exp(shifted)
   result = unnormalized / jnp.sum(unnormalized, axis, where=where, keepdims=True)
   if where is not None:
     result = jnp.where(where, result, 0)
