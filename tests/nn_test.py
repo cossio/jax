@@ -758,7 +758,7 @@ class NNFunctionsTest(jtu.JaxTestCase):
     # custom_jvp rule for it (since otherwise it doesn't pass the numerical
     # checks below).
     if fn is nn.softmax and config.softmax_custom_jvp.value:
-      g_fun = lambda x: jnp.take(fn(x, where=m, initial=-jnp.inf),
+      g_fun = lambda x: jnp.take(fn(x, where=m),
                                 jnp.array([0, 2, 3]))
       jtu.check_grads(g_fun, (x,), order=2)
 
@@ -776,6 +776,129 @@ class NNFunctionsTest(jtu.JaxTestCase):
     x = jnp.array([5.5, 1.3, -4.2, 0.9])
     jtu.check_grads(nn.softmax, (x,), order=2, atol=5e-3)
 
+  @parameterized.product(
+      fn=[nn.softmax, nn.log_softmax],
+      dtype=[jnp.bfloat16, jnp.float16, jnp.float32, jnp.float64],
+      custom_jvp=[False, True])
+  def testSoftmaxFiniteTail(self, fn, dtype, custom_jvp):
+    # Regression for #40344: an exactly rounded probability of one must not
+    # erase a representable derivative. Absolute tolerances hide this failure.
+    if dtype == jnp.float64 and not config.enable_x64.value:
+      self.skipTest("requires x64")
+    gap = {jnp.bfloat16: 8., jnp.float16: 10.,
+           jnp.float32: 18., jnp.float64: 40.}[dtype]
+    tail = np.exp(-gap)
+    denominator = 1 + 2 * tail
+    expected = np.array([2 * tail, -tail, -tail]) / denominator
+    if fn is nn.softmax:
+      expected /= denominator
+    tol = {jnp.bfloat16: 0.02, jnp.float16: 0.003,
+           jnp.float32: 2e-6, jnp.float64: 2e-14}[dtype]
+    with jax.softmax_custom_jvp(custom_jvp):
+      x = jnp.array([gap, 0., 0.], dtype=dtype)
+      select = lambda x: fn(x)[0]
+      for transform in [lambda f: f, jax.jit]:
+        value, gradient = transform(jax.value_and_grad(select))(x)
+        self.assertAllClose(gradient, expected.astype(dtype), atol=0, rtol=tol)
+        tangent = transform(lambda x: jax.jvp(
+            select, (x,), (jnp.array([1., 0., 0.], dtype=dtype),))[1])(x)
+        self.assertAllClose(tangent, expected[0].astype(dtype), atol=0, rtol=tol)
+        self.assertAllClose(gradient.sum(), jnp.zeros((), dtype), atol=0, rtol=0)
+        if fn is nn.log_softmax:
+          self.assertAllClose(value, np.asarray(-np.log1p(2 * tail), dtype),
+                              atol=0, rtol=tol)
+
+  @parameterized.product(fn=[nn.softmax, nn.log_softmax],
+                         axis=[-1, 0, (0, 2), None, ()],
+                         custom_jvp=[False, True])
+  def testSoftmaxTiesAndAxes(self, fn, axis, custom_jvp):
+    # Repeated maxima must retain distinct derivatives for the tied logits.
+    x = jnp.tile(jnp.array([0., -1., 0., -2.]), (2, 3, 1))
+    tangent = jnp.arange(x.size, dtype=x.dtype).reshape(x.shape) / x.size
+    p = scipy.special.softmax(np.asarray(x), axis=axis)
+    expected_tangent = tangent - jnp.sum(p * tangent, axis, keepdims=True)
+    expected = scipy.special.log_softmax(np.asarray(x), axis=axis)
+    if fn is nn.softmax:
+      expected_tangent *= p
+      expected = p
+    with jax.softmax_custom_jvp(custom_jvp):
+      value, actual = jax.jit(lambda x, t: jax.jvp(
+          partial(fn, axis=axis), (x,), (t,)))(x, tangent)
+      self.assertAllClose(value, expected, atol=2e-6, rtol=2e-6)
+      self.assertAllClose(actual, expected_tangent, atol=2e-6, rtol=2e-6)
+
+  @parameterized.product(fn=[nn.softmax, nn.log_softmax],
+                         custom_jvp=[False, True])
+  def testSoftmaxFiniteTailMasked(self, fn, custom_jvp):
+    # Masked NaNs/infinities must not participate in pivot selection or AD.
+    x = jnp.array([[jnp.nan, 0., 18., jnp.inf],
+                   [jnp.nan, 18., 0., jnp.inf]], dtype=jnp.float32)
+    mask = jnp.array([False, True, True, False])
+    expected = np.exp(-18) / (1 + np.exp(-18))
+    if fn is nn.softmax:
+      expected /= 1 + np.exp(-18)
+    expected_gradient = np.array([[0., -expected, expected, 0.],
+                                  [0., expected, -expected, 0.]], np.float32)
+    with jax.softmax_custom_jvp(custom_jvp):
+      def loss(x):
+        values = jax.vmap(lambda row: fn(row, where=mask))(x)
+        return values[0, 2] + values[1, 1]
+      self.assertAllClose(jax.jit(jax.grad(loss))(x), expected_gradient,
+                          atol=0, rtol=2e-6)
+
+  @parameterized.product(fn=[nn.softmax, nn.log_softmax],
+                         custom_jvp=[False, True],
+                         tied=[False, True])
+  def testSoftmaxHigherDerivatives(self, fn, custom_jvp, tied):
+    with jax.enable_x64(), jax.softmax_custom_jvp(custom_jvp):
+      x = jnp.array([0., 0. if tied else -1., -2.], dtype=jnp.float64)
+      jtu.check_grads(fn, (x,), order=2, atol=1e-5, rtol=1e-5)
+
+  @parameterized.parameters(jnp.float32, jnp.float64)
+  def testLogSoftmaxFiniteTailHessian(self, dtype):
+    if dtype == jnp.float64 and not config.enable_x64.value:
+      self.skipTest("requires x64")
+    gap = 18. if dtype == jnp.float32 else 40.
+    tail = np.exp(-gap)
+    expected = (np.array([[1., -1.], [-1., 1.]])
+                * tail / (1 + tail) ** 2).astype(dtype)
+    x = jnp.array([gap, 0.], dtype=dtype)
+    loss = lambda x: -nn.log_softmax(x)[0]
+    for jacobian in [jax.jacfwd, jax.jacrev]:
+      actual = jax.jit(jacobian(jax.grad(loss)))(x)
+      self.assertAllClose(actual, expected, atol=0, rtol=2e-6)
+
+  @parameterized.product(fn=[nn.softmax, nn.log_softmax],
+                         custom_jvp=[False, True])
+  def testSoftmaxSingletonAndNonfinite(self, fn, custom_jvp):
+    with jax.softmax_custom_jvp(custom_jvp):
+      for transform in [lambda f: f, jax.jit]:
+        value, gradient = transform(jax.value_and_grad(lambda x: fn(x)[0]))(
+            jnp.array([1.]))
+        self.assertEqual(value, 1. if fn is nn.softmax else 0.)
+        self.assertArraysEqual(gradient, jnp.zeros(1))
+        for x in [[jnp.inf], [-jnp.inf], [0., jnp.inf], [0., jnp.nan]]:
+          self.assertTrue(jnp.all(jnp.isnan(transform(fn)(jnp.array(x)))))
+        x = jnp.array([jnp.nan, jnp.inf])
+        mask = jnp.zeros(2, dtype=bool)
+        gradient = transform(jax.grad(lambda x: fn(x, where=mask).sum()))(x)
+        self.assertArraysEqual(gradient, jnp.zeros_like(x))
+
+  @parameterized.product(fn=[nn.softmax, nn.log_softmax],
+                         custom_jvp=[False, True])
+  def testSoftmaxComplexDerivative(self, fn, custom_jvp):
+    # Complex softmax entries need not be probabilities: two real parts can
+    # exceed 1/2, invalidating the real-valued centering shortcut.
+    x = jnp.array([0., 0., 3j], dtype=jnp.complex64)
+    tangent = jnp.array([1j, 2., -1.], dtype=x.dtype)
+    p = scipy.special.softmax(np.asarray(x))
+    expected = tangent - jnp.sum(p * tangent)
+    if fn is nn.softmax:
+      expected *= p
+    with jax.softmax_custom_jvp(custom_jvp):
+      actual = jax.jit(lambda x, t: jax.jvp(fn, (x,), (t,))[1])(x, tangent)
+      self.assertAllClose(actual, expected, atol=2e-6, rtol=2e-6)
+
   def testSoftmaxGradResiduals(self):
     if not config.softmax_custom_jvp.value:
       raise unittest.SkipTest("only applies when upgrade flag enabled")
@@ -788,8 +911,9 @@ class NNFunctionsTest(jtu.JaxTestCase):
 
     with jax.softmax_custom_jvp(False):
       res = ad_checkpoint.saved_residuals(nn.softmax, x)
-    self.assertLen(res, 3)
-    self.assertEqual(sum(a.size for a, _ in res), 6)
+    # The stable max-shift derivative also retains the shifted logits.
+    self.assertLen(res, 4)
+    self.assertEqual(sum(a.size for a, _ in res), 10)
 
     with jax.softmax_custom_jvp(True):
       res = ad_checkpoint.saved_residuals(nn.softmax, x)

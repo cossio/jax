@@ -77,18 +77,20 @@ class PallasCostEstimateTest(jtu.JaxTestCase):
         jax.ShapeDtypeStruct(b_shape, jnp.float32))
     self.assertEqual(cost.flops, expected_flops)
 
-  def test_attention(self):
+  @parameterized.parameters(False, True)
+  def test_attention(self, custom_jvp):
     qk_dim = 16
     v_dim = 4
     kv_len = 128
     q_len = 64
     def attention(q, k, v):
       return jax.nn.softmax(q @ k.T, axis=-1) @ v
-    cost = cost_estimate.estimate_cost(
-        attention,
-        jnp.zeros((q_len, qk_dim), dtype=jnp.float32),
-        jnp.zeros((kv_len, qk_dim), dtype=jnp.float32),
-        jnp.zeros((kv_len, v_dim), dtype=jnp.float32))
+    with jax.softmax_custom_jvp(custom_jvp):
+      cost = cost_estimate.estimate_cost(
+          attention,
+          jnp.zeros((q_len, qk_dim), dtype=jnp.float32),
+          jnp.zeros((kv_len, qk_dim), dtype=jnp.float32),
+          jnp.zeros((kv_len, v_dim), dtype=jnp.float32))
     qk_cost = 2 * q_len * kv_len * qk_dim
     v_cost = 2 * q_len * kv_len * v_dim
     softmax_flops = kv_len * q_len
