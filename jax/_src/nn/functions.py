@@ -569,19 +569,13 @@ def log_softmax(x: ArrayLike,
   """
   x_arr = numpy_util.ensure_arraylike("log_softmax", x)
   shifted = _softmax_shift(x_arr, axis, where)
-  if dtypes.issubdtype(x_arr.dtype, np.complexfloating):
-    shifted_logsumexp = jnp.log(
-        jnp.sum(jnp.exp(shifted), axis, where=where, keepdims=True))
-  else:
-    is_max = shifted == 0
-    count = jnp.sum(is_max, axis, keepdims=True)
-    unique_max = is_max & (count == 1)
-    # Keep the small non-maximal exponentials separate from the maximum's 1.
-    # Subtracting 1 is safe in the tied case: the sum is then at least 2.
-    tail = jnp.sum(jnp.where(unique_max, 0, jnp.exp(shifted)),
-                   axis, where=where, keepdims=True)
-    shifted_logsumexp = jnp.log1p(tail - (count > 1).astype(tail.dtype))
-  result = shifted - shifted_logsumexp
+  is_max = shifted == 0
+  count = jnp.sum(is_max, axis, keepdims=True)
+  # Keep the small non-maximal exponentials separate from the maximum's 1.
+  # Subtracting 1 is safe in the tied case: the sum is then at least 2.
+  tail = jnp.sum(jnp.where(is_max & (count == 1), 0, jnp.exp(shifted)),
+                 axis, where=where, keepdims=True)
+  result = shifted - jnp.log1p(tail - (count > 1))
   if where is not None:
     return jnp.where(where, result, -np.inf)
   return result
@@ -602,8 +596,6 @@ def _softmax_shift_jvp(axis, primals, tangents):
 
 @partial(ad_checkpoint.checkpoint, static_argnums=(2,), prevent_cse=False)
 def _softmax_shift_tangent(shifted, x_dot, axis, where):
-  if dtypes.issubdtype(shifted.dtype, np.complexfloating):
-    return x_dot if where is None else jnp.where(where, x_dot, 0)
   # Recompute the masks during transposition instead of saving extra arrays.
   is_max = shifted == 0
   count = jnp.sum(is_max, axis, keepdims=True)

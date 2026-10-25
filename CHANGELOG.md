@@ -38,6 +38,10 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
     boolean outputs, which is much faster for long axes ({jax-issue}`#28097`).
 
 * Bug fixes
+  * {func}`jax.nn.softmax` and {func}`jax.nn.log_softmax` no longer round the
+    gradient of a dominant logit to zero when its probability rounds to one,
+    and {func}`jax.nn.log_softmax` now returns an accurate value at such a
+    logit ({jax-issue}`#40344`).
   * {func}`jax.scipy.linalg.polar` with `method="qdwh"` now honors
     `max_iterations` and accepts `eps`, as documented; previously
     `max_iterations` was silently ignored and any `eps` raised a `ValueError`.
